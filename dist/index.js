@@ -1,21 +1,59 @@
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { logger } from 'hono/logger';
+import { sign, verify } from 'hono/jwt';
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse, } from '@simplewebauthn/server';
 const app = new Hono();
-app.use('*', cors());
+app.use('*', logger());
+app.use('*', cors({
+    origin: '*',
+    allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    // allowHeaders: ['Content-Type', 'Authorization'],
+    // credentials: true
+}));
 // In-memory storage for demo purposes
 const users = new Map();
 const challenges = new Map();
 // Configuration
 const rpName = 'Passkey Demo';
 const rpID = 'localhost';
-const origin = 'http://localhost:3000';
+const JWT_SECRET = 'demo-secret-key-please-change-in-production';
+// Mock data for JWT payload
+const mockPayload = {
+    iccid: "8942310xxxxxxxxxxxx",
+    otaSupported: true,
+    primaryImsi: "29505xxxxxxxxx",
+    subscribers: {
+        "29505xxxxxxxxx": {
+            capabilities: {
+                data: true,
+                sms: true,
+                voice: true,
+            },
+            imsi: "29505xxxxxxxxxxxx",
+            msisdn: "xxxxxxxxxxxx",
+            status: "active",
+            subscription: "plan01s"
+        },
+        "441200xxxxxxxxx": {
+            capabilities: {
+                data: true,
+                sms: false,
+                voice: false,
+            },
+            imsi: "441200xxxxxxxxx",
+            msisdn: "8120xxxxxxxxxxx",
+            status: "active",
+            subscription: "planX2"
+        }
+    }
+};
 app.get('/', (c) => {
     return c.text('Passkey Demo Server');
 });
 // Registration endpoints
-app.post('/attestation/options', async (c) => {
+app.post('/attestation/option', async (c) => {
     const { username } = await c.req.json();
     if (!username) {
         return c.json({ error: 'Username is required' }, 400);
@@ -36,8 +74,10 @@ app.post('/attestation/options', async (c) => {
             transports: cred.transports,
         })),
         authenticatorSelection: {
-            residentKey: 'preferred',
-            userVerification: 'preferred',
+            // residentKey: 'preferred',
+            // userVerification: 'preferred',
+            requireResidentKey: false,
+            userVerification: 'discouraged',
         },
     };
     const options = await generateRegistrationOptions(opts);
@@ -56,8 +96,9 @@ app.post('/attestation/result', async (c) => {
     const opts = {
         response: credential,
         expectedChallenge,
-        expectedOrigin: origin,
+        expectedOrigin: 'http://localhost:4200',
         expectedRPID: rpID,
+        requireUserVerification: false,
     };
     try {
         const verification = await verifyRegistrationResponse(opts);
@@ -88,7 +129,7 @@ app.post('/attestation/result', async (c) => {
     }
 });
 // Authentication endpoints
-app.post('/assertion/options', async (c) => {
+app.post('/assertion/option', async (c) => {
     const { username } = await c.req.json();
     if (!username) {
         return c.json({ error: 'Username is required' }, 400);
@@ -129,24 +170,61 @@ app.post('/assertion/result', async (c) => {
     const opts = {
         response: credential,
         expectedChallenge,
-        expectedOrigin: origin,
+        // expectedOrigin: origin,
+        expectedOrigin: 'http://localhost:4200',
         expectedRPID: rpID,
         credential: {
             id: userCredential.id,
             publicKey: userCredential.publicKey,
             counter: userCredential.counter,
         },
+        requireUserVerification: false,
     };
     try {
         const verification = await verifyAuthenticationResponse(opts);
         if (verification.verified) {
             userCredential.counter = verification.authenticationInfo.newCounter;
-            return c.json({ verified: true });
+            // Generate JWT token
+            const token = await sign({
+                ...mockPayload,
+                sub: username,
+                iat: Math.floor(Date.now() / 1000),
+                exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24), // 24 hours
+            }, JWT_SECRET);
+            return c.json({
+                verified: true,
+                accessToken: token
+            });
         }
         return c.json({ verified: false, error: 'Authentication failed' }, 400);
     }
     catch (error) {
         return c.json({ verified: false, error: error.message }, 400);
+    }
+});
+// JWT verification endpoint
+app.get('/verify', async (c) => {
+    const authHeader = c.req.header('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return c.json({ status: 'NG', error: 'Authorization header required' }, 401);
+    }
+    const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+    try {
+        const decoded = await verify(token, JWT_SECRET);
+        // Log ICCID and IMSI list to console
+        console.log('=== JWT Verification Success ===');
+        console.log('ICCID:', decoded.iccid);
+        console.log('Primary IMSI:', decoded.primaryImsi);
+        console.log('Subscriber IMSIs:');
+        Object.entries(decoded.subscribers).forEach(([_, subscriber]) => {
+            console.log(`  - ${subscriber.imsi} (${subscriber.status})`);
+        });
+        console.log('================================');
+        return c.json({ status: 'OK' });
+    }
+    catch (error) {
+        console.log('JWT verification failed:', error.message);
+        return c.json({ status: 'NG', error: 'Invalid token' }, 401);
     }
 });
 serve({
